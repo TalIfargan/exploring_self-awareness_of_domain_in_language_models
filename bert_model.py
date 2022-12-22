@@ -19,6 +19,7 @@ books_train_dataset = train_dataset.filter(lambda example: example['product_cate
 dvd_train_dataset = train_dataset.filter(lambda example: example['product_category'] == 'DVD')
 electronics_train_dataset = train_dataset.filter(lambda example: example['product_category'] == 'Electronics')
 kitchen_train_dataset = train_dataset.filter(lambda example: example['product_category'] == 'Kitchen')
+
 # set the label to 0 for negative reviews and 1 for positive reviews if the rating is greater than 3 stars, drop neutral reviews
 books_train_dataset = books_train_dataset.map(lambda example: {'label': 1 if example['star_rating'] > 3 else 0})
 dvd_train_dataset = dvd_train_dataset.map(lambda example: {'label': 1 if example['star_rating'] > 3 else 0})
@@ -26,11 +27,20 @@ electronics_train_dataset = electronics_train_dataset.map(lambda example: {'labe
 kitchen_train_dataset = kitchen_train_dataset.map(lambda example: {'label': 1 if example['star_rating'] > 3 else 0})
 
 # balance the dataset to have the same number of positive and negative reviews for each category make the dataset as big as possible
-books_train_dataset = books_train_dataset.filter(lambda example: example['label'] == 1).shuffle(seed=42)
-dvd_train_dataset = dvd_train_dataset.filter(lambda example: example['label'] == 1).shuffle(seed=42)
-electronics_train_dataset = electronics_train_dataset.filter(lambda example: example['label'] == 1).shuffle(seed=42)
-kitchen_train_dataset = kitchen_train_dataset.filter(lambda example: example['label'] == 1).shuffle(seed=42)
+books_balanced_train_dataset = books_train_dataset.filter(lambda example: example['label'] == 1).shuffle(seed=42)
+books_balanced_train_dataset = books_balanced_train_dataset.concatenate(books_train_dataset.filter(lambda example: example['label'] == 0).shuffle(seed=42).select(range(books_balanced_train_dataset.dataset_size)))
+dvd_balanced_train_dataset = dvd_train_dataset.filter(lambda example: example['label'] == 1).shuffle(seed=42)
+dvd_balanced_train_dataset = dvd_balanced_train_dataset.concatenate(dvd_train_dataset.filter(lambda example: example['label'] == 0).shuffle(seed=42).select(range(dvd_balanced_train_dataset.dataset_size)))
+electronics_balanced_train_dataset = electronics_train_dataset.filter(lambda example: example['label'] == 1).shuffle(seed=42)
+electronics_balanced_train_dataset = electronics_balanced_train_dataset.concatenate(electronics_train_dataset.filter(lambda example: example['label'] == 0).shuffle(seed=42).select(range(electronics_balanced_train_dataset.dataset_size)))
+kitchen_balanced_train_dataset = kitchen_train_dataset.filter(lambda example: example['label'] == 1).shuffle(seed=42)
+kitchen_balanced_train_dataset = kitchen_balanced_train_dataset.concatenate(kitchen_train_dataset.filter(lambda example: example['label'] == 0).shuffle(seed=42).select(range(kitchen_balanced_train_dataset.dataset_size)))
 
+# save the balanced datasets
+books_balanced_train_dataset.save_to_disk('data/books_balanced_train_dataset')
+dvd_balanced_train_dataset.save_to_disk('data/dvd_balanced_train_dataset')
+electronics_balanced_train_dataset.save_to_disk('data/electronics_balanced_train_dataset')
+kitchen_balanced_train_dataset.save_to_disk('data/kitchen_balanced_train_dataset')
 
 # train the model
 from transformers import AdamW, get_linear_schedule_with_warmup
