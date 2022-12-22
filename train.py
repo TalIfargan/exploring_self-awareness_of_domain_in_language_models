@@ -45,7 +45,7 @@ class ReviewDataset(Dataset):
                                           return_attention_mask=True,
                                           return_tensors='pt',
                                           return_token_type_ids=False,
-                                          pad_to_max_length=True,
+                                          padding='max_length',
                                           truncation=True)
     return {
       'review_text' : review,
@@ -56,7 +56,7 @@ class ReviewDataset(Dataset):
 
 def create_data_loader(df, tokenizer, max_len, batch_size):
   ds = ReviewDataset(
-    reviews=df['review_body'].to_numpy(),
+    reviews=df['reviewText'].to_numpy(),
     targets=df['label'].to_numpy(),
     tokenizer=tokenizer,
     max_len=max_len
@@ -65,7 +65,7 @@ def create_data_loader(df, tokenizer, max_len, batch_size):
   return DataLoader(
     ds,
     batch_size=batch_size,
-    sampler=RandomSampler(ds),
+    # sampler=RandomSampler(ds),
     num_workers=4,
     shuffle=True,
     pin_memory=True  # For faster data transfer from host to GPU in CUDA-enabled GPUs   
@@ -98,6 +98,7 @@ def main():
     parser.add_argument("--model_dir", type=str, required=True, help="path to directory to save model")
     parser.add_argument("--lr", type=float, default=2e-5, help="learning rate")
     parser.add_argument("--dataset_dir", type=str, required=True, help="path to directory to load datasets")
+    parser.add_argument("--domain_name", type=str, required=True, help="name of domain")
     args = parser.parse_args()
 
     RANDOM_SEED = args.seed
@@ -119,19 +120,19 @@ def main():
 
     # Load data
     drive_path = args.dataset_dir
-    df_train = pd.read_csv(drive_path+"train.csv")
-    df_val = pd.read_csv(drive_path+"validation.csv")
-    df_test = pd.read_csv(drive_path+"test.csv")
+    df_train = pd.read_csv(os.path.join(drive_path, "train.csv"))
+    # df_val = pd.read_csv(drive_path+"validation.csv")
+    df_val = pd.read_csv(os.path.join(drive_path, "test.csv"))
 
     model_dir = args.model_dir
-    model_save_path = model_dir + "bert_multilingual_model_app_review/"
+    model_save_path = os.path.join(model_dir, args.model_name+'_'+args.domain_name+'_'+str(args.seed))
 
     # Initializing model based tokenizer
     tokenizer = BertTokenizer.from_pretrained(PRETRAINED_MODEL_NAME, do_lower_case=False)
 
     train_data_loader = create_data_loader(df_train, tokenizer, MAX_LEN, BATCH_SIZE)
     val_data_loader = create_data_loader(df_val, tokenizer, MAX_LEN, BATCH_SIZE)
-    test_data_loader = create_data_loader(df_test, tokenizer, MAX_LEN, BATCH_SIZE)
+    # test_data_loader = create_data_loader(df_test, tokenizer, MAX_LEN, BATCH_SIZE)
 
     # Using BertforSequenceClassification which is same as adding a linear layer to pre-trained BertModel which 
     # returns raw hidden states having no head on top
@@ -204,6 +205,10 @@ def main():
                               token_type_ids=None,
                               attention_mask=b_input_mask,
                               labels=b_labels)
+        print("-------------")
+        print(loss)
+        print("-------------")
+        print(logits)
         total_train_loss += loss.item()
         # Scales loss.  Calls backward() on scaled loss to create scaled gradients.
         # Backward passes under autocast are not recommended.
@@ -221,8 +226,8 @@ def main():
         scaler.update()
 
         # Clip gradients to 1.0 to avoid exploding gradients. Uncomment below line to observe performance change
-        # torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
-        # optimizer.step()
+        torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
+        optimizer.step()
 
         # Update learning rate
         scheduler.step()
