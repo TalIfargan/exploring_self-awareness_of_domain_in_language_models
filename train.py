@@ -19,6 +19,8 @@ from torch.utils.data import Dataset, DataLoader, RandomSampler
 import torch
 from torch import nn
 from torch.cuda.amp import GradScaler, autocast
+from tqdm import tqdm
+import wandb
 
 # Defining custom Dataset class by inheriting Dataset abstract class from torch and 
 # overriding __len__ & __getitem__ functions
@@ -68,6 +70,7 @@ def create_data_loader(df, tokenizer, max_len, batch_size):
     # sampler=RandomSampler(ds),
     num_workers=4,
     shuffle=True,
+    drop_last=True, # Drop last incomplete batch to avoid nan loss
     pin_memory=True  # For faster data transfer from host to GPU in CUDA-enabled GPUs   
   )
 
@@ -99,6 +102,8 @@ def main():
     parser.add_argument("--lr", type=float, default=2e-5, help="learning rate")
     parser.add_argument("--dataset_dir", type=str, required=True, help="path to directory to load datasets")
     parser.add_argument("--domain_name", type=str, required=True, help="name of domain")
+    parser.add_argument("--num_train_samples", type=int, required=True, help="number of training samples")
+    parser.add_argument("--log_to_wandb", type=bool, default=False, help="log to wandb")
     args = parser.parse_args()
 
     RANDOM_SEED = args.seed
@@ -106,8 +111,12 @@ def main():
     np.random.seed(RANDOM_SEED)
     torch.manual_seed(RANDOM_SEED)
     torch.cuda.manual_seed_all(RANDOM_SEED)
+    
+    if args.log_to_wandb:
+      WANDB_START_METHOD = "thread"
+      wandb.init(project="DPML", entity="tandl", name="BERT_"+args.model_name+'_'+args.domain_name+'_'+str(args.seed), save_code=True)
 
-
+    # device = torch.device("cpu")
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(device)
 
@@ -117,6 +126,8 @@ def main():
     lr = args.lr
     EPOCHS = args.epoch                    # 3-4 epochs suffice for fine-tuning BERT
     eps = 1e-8
+    NUM_TRAIN_SAMPLES = args.num_train_samples
+    NUM_VALID_SAMPELS = int(0.2 * NUM_TRAIN_SAMPLES)
 
     # Load data
     drive_path = args.dataset_dir
@@ -128,10 +139,10 @@ def main():
     model_save_path = os.path.join(model_dir, args.model_name+'_'+args.domain_name+'_'+str(args.seed))
 
     # Initializing model based tokenizer
-    tokenizer = BertTokenizer.from_pretrained(PRETRAINED_MODEL_NAME, do_lower_case=False)
+    tokenizer = BertTokenizer.from_pretrained(PRETRAINED_MODEL_NAME)
 
-    train_data_loader = create_data_loader(df_train, tokenizer, MAX_LEN, BATCH_SIZE)
-    val_data_loader = create_data_loader(df_val, tokenizer, MAX_LEN, BATCH_SIZE)
+    train_data_loader = create_data_loader(df_train.sample(NUM_TRAIN_SAMPLES), tokenizer, MAX_LEN, BATCH_SIZE)
+    val_data_loader = create_data_loader(df_val.sample(NUM_VALID_SAMPELS), tokenizer, MAX_LEN, BATCH_SIZE)
     # test_data_loader = create_data_loader(df_test, tokenizer, MAX_LEN, BATCH_SIZE)
 
     # Using BertforSequenceClassification which is same as adding a linear layer to pre-trained BertModel which 
@@ -163,7 +174,7 @@ def main():
 
     # Measure the total training time for the whole run.
     total_t0 = time.time()
-
+    # with torch.autograd.detect_anomaly():
     # For each epoch...
     for epoch_i in range(0, EPOCHS):
       print("")
@@ -175,6 +186,7 @@ def main():
 
       # reset the total loss for this training epoch
       total_train_loss = 0
+      total_train_accuracy = 0
 
       # Put the model in training mode so that dropout and batch norm layers can behave accordingly
       # https://stackoverflow.com/questions/51433378/what-does-model-train-do-in-pytorch)
@@ -193,9 +205,12 @@ def main():
         b_input_ids = batch['input_ids'].to(device)
         b_input_mask = batch['attention_mask'].to(device)
         b_labels = batch['targets'].to(device)
+        # print(b_input_ids)
+        # print(b_input_mask)
+        # print(b_labels)
 
         # Clear previously calculated gradients before backward pass
-        model.zero_grad()  
+        model.zero_grad()
 
         # Perform forward pass. Here we also obtain loss since we passed labels
         # logits - model outputs prior to activation
@@ -204,12 +219,25 @@ def main():
             loss, logits = model(b_input_ids,
                               token_type_ids=None,
                               attention_mask=b_input_mask,
-                              labels=b_labels)
-        print("-------------")
-        print(loss)
-        print("-------------")
-        print(logits)
+                              labels=b_labels).values()
+        # print(loss.item())
+        # print(logits)
+        if np.isnan(loss.item()):
+          print("Loss is nan")
+          print("b_input_ids", b_input_ids)
+          print("b_input_mask", b_input_mask)
+          print("b_labels", b_labels)
+          print("logits", logits)
+          print("loss", loss)
+          break
+
         total_train_loss += loss.item()
+        # calculate accuracy for current batch
+        curr_train_accuracy = flat_accuracy(logits.detach().cpu().numpy(), b_labels.cpu().numpy())
+        total_train_accuracy += curr_train_accuracy
+        if args.log_to_wandb:
+          # Log metrics
+          wandb.log({"train_loss": loss.item(), "train_accuracy": curr_train_accuracy})
         # Scales loss.  Calls backward() on scaled loss to create scaled gradients.
         # Backward passes under autocast are not recommended.
         # Backward ops run in the same dtype autocast chose for corresponding forward ops.
@@ -225,8 +253,9 @@ def main():
         # Updates the scale for next iteration.
         scaler.update()
 
-        # Clip gradients to 1.0 to avoid exploding gradients. Uncomment below line to observe performance change
-        torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
+        # Clip gradients to 1.0 to avoid exploding gradients.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # with torch.autograd.detect_anomaly():
         optimizer.step()
 
         # Update learning rate
@@ -234,11 +263,13 @@ def main():
 
       # Average training loss over all batches in current epoch
       avg_train_loss = total_train_loss / len(train_data_loader)
+      avg_train_accuracy = total_train_accuracy / len(train_data_loader)
 
       # Measure how long this epoch took
       training_time = format_time(time.time() - t0)
       print("")
       print("  Average training loss: {0:.2f}".format(avg_train_loss))
+      print("  Average training accuracy: {0:.2f}".format(avg_train_accuracy))
       print("  Training epcoh took: {:}".format(training_time))
 
       # After the completion of each training epoch, measure our performance on
@@ -256,7 +287,7 @@ def main():
       # Tracking variables 
       total_eval_accuracy = 0
       total_eval_loss = 0
-      nb_eval_steps = 0
+      # nb_eval_steps = 0
 
       # Evaluate data for one epoch
       for batch in val_data_loader:
@@ -270,7 +301,7 @@ def main():
           loss, logits = model(b_input_ids,
                               token_type_ids=None,
                               attention_mask=b_input_mask,
-                              labels=b_labels)
+                              labels=b_labels).values()
           total_eval_loss += loss.item()
 
           # Move logits and labels to CPU
@@ -284,26 +315,30 @@ def main():
         # Report final accuracy for this validation run
         avg_val_accuracy = total_eval_accuracy / len(val_data_loader)
         
-    # Calculate the average loss over all of the batches.
-    avg_val_loss = total_eval_loss / len(val_data_loader)
+        # Calculate the average loss over all of the batches.
+        avg_val_loss = total_eval_loss / len(val_data_loader)
 
-    # Measure how long the validation run took.
-    validation_time = format_time(time.time() - t0)
+      # Measure how long the validation run took.
+      validation_time = format_time(time.time() - t0)
 
-    print("  Validation Loss: {0:.2f}".format(avg_val_loss))
-    print("  Validation took: {:}".format(validation_time))
+      print("  Validation Loss: {0:.2f}".format(avg_val_loss))
+      print("  Validation took: {:}".format(validation_time))
 
-    # Record all statistics from this epoch.
-    training_stats.append(
-        {
-            'epoch': epoch_i + 1,
-            'Training Loss': avg_train_loss,
-            'Valid. Loss': avg_val_loss,
-            'Valid. Accur.': avg_val_accuracy,
-            'Training Time': training_time,
-            'Validation Time': validation_time
-        }
-    )
+      # Record all statistics from this epoch.
+      training_stats.append(
+          {
+              'epoch': epoch_i + 1,
+              'Training Loss': avg_train_loss,
+              'Training Accur.': avg_train_accuracy,
+              'Valid. Loss': avg_val_loss,
+              'Valid. Accur.': avg_val_accuracy,
+              'Training Time': training_time,
+              'Validation Time': validation_time
+          }
+      )
+      if args.log_to_wandb:
+        # Log metrics
+        wandb.log({"Training Loss": avg_train_loss, "Training Accur.": avg_train_accuracy, "Valid. Loss": avg_val_loss, "Valid. Accur.": avg_val_accuracy})
 
     print("")
     print("Training complete!")
@@ -322,3 +357,8 @@ def main():
 
 if __name__ == '__main__':
     main()
+    # delete all objects in memory
+    objects = dir()
+    for obj in objects:
+      if not obj.startswith("__"):
+        del globals()[obj]
